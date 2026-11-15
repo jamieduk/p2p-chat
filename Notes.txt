@@ -1,0 +1,37 @@
+P2P
+
+
+https://jnetai.com/apps/p2p-chat/
+
+Added dark scrollbar styling to both files:
+color-scheme: dark for native dark controls
+Firefox: thin #475569 thumb on #0f172a track
+WebKit/Chromium: 10px rounded thumb with hover state and matching corner
+Applies to the chat message pane and any other scrollable area.
+
+Fixed in index.html and index.php:
+- 0-byte files: chunks were being JSON-serialized, so Uint8Array arrived as a plain object and reassembled to an empty blob. Chunks now send as real binary with {id, i} metadata, are awaited in order, and the final size is validated.
+- Image previews: image attachments render inline (clickable to open full size).
+- Downloads: blob is built from ordered chunks with a correct MIME type, so Download returns the actual file.
+- Copy buttons: all "Copy" text buttons are now clipboard icons with shrink-0, padding, and min-w-0 inputs, so nothing overflows its container.
+Verified with two headless browsers: a 10 KB PNG transferred with a 64×64 preview and a matching 10,362-byte download; a 200 KB binary downloaded at exactly 200,000 bytes. Copy icons render with no overflow.
+
+
+Created in /home/jay/Documents/Scripts/AI/Opencode/Projects/WEB-APPS/p2p-chat/:
+- index.html — anonymous P2P chat app (WebRTC via Trystero/Nostr signaling)
+- Create session: generates 6-digit PIN, share link (#room=PIN), and QR code; waits for peer
+- Join session: via PIN entry or shared link/QR
+- Chat: real-time P2P messages, copy-to-clipboard for received text
+- Files: P2P chunked file transfer with download attachments for received files
+- ICE: Google STUN + public TURN relays configured to broker NAT traversal
+- README.md — features, usage, and notes
+Run: open index.html in a modern browser (or python3 -m http.server 8000 in the folder). Share the PIN/link/QR with a peer; both must keep the tab open (internet required for signaling/ICE/CDN).
+
+
+
+Fixed in index.html and index.php:
+- Create did nothing: the trystero CDN URL (esm.run/trystero/nostr) now 404s, so the whole module failed before binding click handlers. Replaced with version-pinned, dynamic imports (trystero@0.21.8, with esm.sh fallback) loaded inside the click handlers.
+- QR missing: the qrcode script path build/qrcode.min.js also 404s. Now imports qrcode@1.5.3/+esm dynamically with fallback.
+- Share links/QR now use https://jnetai.com/apps/p2p-chat/?code=<PIN> everywhere, and ?code=... / #room=... auto-joins on load.
+- Join input now accepts a full invite URL, PIN, or code.
+Verified in headless Chromium: create shows PIN/link/QR, ?code= join works, two peers connect and messages deliver.
