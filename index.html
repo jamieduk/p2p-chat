@@ -88,12 +88,13 @@ const cfg = { appId: 'netchat-p2p-demo-v1', rtcConfig: { iceServers: [
   {urls:['turn:openrelay.metered.ca:443?transport=tcp'], username:'openrelayproject', credential:'openrelayproject'}
 ]}};
 
-let room = null, sendMsg = null, sendFileMeta = null, sendFileChunk = null, sendFileEnd = null;
+let room = null, sendMsg = null, sendFileMeta = null, sendFileChunk = null, sendFileEnd = null, sendPing = null;
 let peers = new Set();
-let pendingFile = null;
+let pendingFile = null, activeTransfers = 0;
 let trysteroMod = null, qrMod = null, starting = false;
 let currentPin = null, hasConnected = false;
-let reconnectTimer = null, reconnectAttempts = 0, reconnecting = false;
+let reconnectTimer = null, reconnectAttempts = 0, reconnecting = false, pendingReconnect = false;
+let heartbeatTimer = null, verifyTimer = null, lastHeardAt = 0;
 const outbox = [];
 let flushing = false;
 const incomingFiles = new Map();
@@ -194,16 +195,46 @@ function addMessage({from, text, ts, self=false, file=null}){
 
 function canSend(){ return !!(room && sendMsg && peers.size>0); }
 function clearReconnectTimer(){ if(reconnectTimer){ clearTimeout(reconnectTimer); reconnectTimer=null; } }
+function markHeard(){ lastHeardAt = Date.now(); }
+function stopHeartbeat(){ if(heartbeatTimer){ clearInterval(heartbeatTimer); heartbeatTimer=null; } if(verifyTimer){ clearTimeout(verifyTimer); verifyTimer=null; } }
+function verifyConnection(timeout){
+  if(!currentPin || peers.size===0 || !sendPing || activeTransfers>0) return;
+  const sentAt = Date.now();
+  try{ sendPing({t:sentAt}); }catch(e){}
+  if(verifyTimer) clearTimeout(verifyTimer);
+  verifyTimer = setTimeout(()=>{
+    verifyTimer = null;
+    if(peers.size>0 && lastHeardAt < sentAt) forceReconnect(0);
+  }, timeout||5000);
+}
+function forceReconnect(delay){
+  if(!currentPin || starting || reconnecting) return;
+  if(verifyTimer){ clearTimeout(verifyTimer); verifyTimer=null; }
+  peers.clear();
+  const info = $('peerInfo'); if(info) info.textContent = '0 peers connected';
+  scheduleReconnect(delay==null?0:delay);
+}
+function startHeartbeat(){
+  stopHeartbeat();
+  heartbeatTimer = setInterval(()=>{
+    if(document.hidden || !currentPin || peers.size===0 || !sendPing) return;
+    if(lastHeardAt && Date.now()-lastHeardAt > 40000){ forceReconnect(0); return; }
+    try{ sendPing({t:Date.now()}); }catch(e){}
+  }, 15000);
+}
 function scheduleReconnect(delay){
-  if(!currentPin || reconnecting || starting) return;
-  if(room && peers.size>0){ clearReconnectTimer(); return; }
+  if(!currentPin) return;
+  if(room && peers.size>0){ clearReconnectTimer(); pendingReconnect=false; return; }
+  if(reconnecting || starting){ pendingReconnect=true; return; }
   if(reconnectTimer) return;
   const wait = (delay==null) ? Math.min(15000, 4000*Math.pow(2, Math.min(reconnectAttempts, 3))) : delay;
   reconnectTimer=setTimeout(()=>{ reconnectTimer=null; reconnectNow(); }, wait);
 }
 async function reconnectNow(){
-  if(!currentPin || reconnecting || starting) return;
+  if(!currentPin) return;
+  if(reconnecting || starting){ pendingReconnect=true; return; }
   if(room && peers.size>0){ clearReconnectTimer(); return; }
+  pendingReconnect=false;
   reconnecting=true;
   setStatus('Reconnecting...', false);
   try{ await startRoom(currentPin, true); }
@@ -214,13 +245,19 @@ async function reconnectNow(){
   }
 }
 async function flushOutbox(){
-  if(flushing || !canSend()) return;
+  if(flushing) return;
+  if(!canSend()){
+    if(outbox.length && currentPin) scheduleReconnect(0);
+    return;
+  }
   flushing=true;
   try{
     while(outbox.length && canSend()){
-      const item=outbox.shift();
+      const item = outbox[0];
       if(item.kind==='text') await sendMsg(item.payload);
       else if(item.kind==='file') await transmitFile(item.file, item.caption);
+      if(peers.size===0){ scheduleReconnect(0); break; }
+      outbox.shift();
     }
   }catch(e){
     console.error('Outbox flush failed', e);
@@ -243,9 +280,12 @@ async function startRoom(pin, isReconnect=false){
     updateUrl(pin);
   }
   starting = true;
+  stopHeartbeat();
+  clearReconnectTimer();
   if(room){ try{ await room.leave(); }catch(e){} room = null; }
   peers.clear(); incomingFiles.clear();
-  sendMsg = sendFileMeta = sendFileChunk = sendFileEnd = null;
+  sendMsg = sendFileMeta = sendFileChunk = sendFileEnd = sendPing = null;
+  lastHeardAt = 0;
   $('peerInfo').textContent = '0 peers connected';
   setStatus('Connecting to room...', false);
   try{
@@ -255,28 +295,35 @@ async function startRoom(pin, isReconnect=false){
     const [_sendMeta, _getMeta] = room.makeAction('fmeta');
     const [_sendChunk, _getChunk] = room.makeAction('fchunk');
     const [_sendEnd, _getEnd] = room.makeAction('fend');
-    sendMsg=_sendMsg; sendFileMeta=_sendMeta; sendFileChunk=_sendChunk; sendFileEnd=_sendEnd;
+    const [_sendPing, _getPing] = room.makeAction('ping');
+    const [_sendPong, _getPong] = room.makeAction('pong');
+    sendMsg=_sendMsg; sendFileMeta=_sendMeta; sendFileChunk=_sendChunk; sendFileEnd=_sendEnd; sendPing=_sendPing;
 
     room.onPeerJoin(id=>{
       peers.add(id);
       hasConnected = true;
       reconnectAttempts = 0;
+      pendingReconnect = false;
+      markHeard();
       clearReconnectTimer();
       $('peerInfo').textContent = `${peers.size} peer(s) connected`;
       setStatus(`Connected (${peers.size} peer)`, true);
       addMessage({from:'system', text:'Peer joined: '+String(id).slice(0,6), self:false, ts:Date.now()});
+      startHeartbeat();
       flushOutbox();
     });
     room.onPeerLeave(id=>{
       peers.delete(id);
+      lastHeardAt = 0;
       $('peerInfo').textContent = `${peers.size} peer(s) connected`;
       setStatus(peers.size?`Connected (${peers.size} peer)`:(hasConnected?'Reconnecting...':'Waiting for peer'), peers.size>0);
       if(peers.size===0 && currentPin && (hasConnected || outbox.length)) scheduleReconnect(1000);
     });
 
-    _getMsg((data, id)=> addMessage({from:String(id).slice(0,6), text:data.text, ts:data.ts, self:false}));
-    _getMeta((m, id)=> incomingFiles.set(m.id, {meta:m, chunks:[], received:0, from:id}));
+    _getMsg((data, id)=>{ markHeard(); addMessage({from:String(id).slice(0,6), text:data.text, ts:data.ts, self:false}); });
+    _getMeta((m, id)=>{ markHeard(); incomingFiles.set(m.id, {meta:m, chunks:[], received:0, from:id}); });
     _getChunk((data, id, meta)=>{
+      markHeard();
       if(!meta) return;
       const e=incomingFiles.get(meta.id); if(!e) return;
       const chunk = data instanceof Uint8Array ? data : new Uint8Array(data);
@@ -284,6 +331,7 @@ async function startRoom(pin, isReconnect=false){
       e.received+=chunk.byteLength;
     });
     _getEnd((eInfo, id)=>{
+      markHeard();
       const e=incomingFiles.get(eInfo.id); if(!e) return;
       incomingFiles.delete(eInfo.id);
       const parts=[];
@@ -297,6 +345,12 @@ async function startRoom(pin, isReconnect=false){
       addMessage({from:String(id).slice(0,6), text:eInfo.text||'', file:{name:e.meta.name,size:e.meta.size,type,blob}, ts:Date.now(), self:false});
     });
 
+    _getPing((d, id)=>{
+      markHeard();
+      try{ _sendPong({t:(d&&d.t)||0}, id); }catch(e){}
+    });
+    _getPong(()=>{ markHeard(); });
+
     showChat(pin);
   }catch(e){
     console.error(e);
@@ -305,12 +359,13 @@ async function startRoom(pin, isReconnect=false){
     else alert('Could not start chat: ' + (e && e.message ? e.message : e));
   }finally{
     starting = false;
+    if(pendingReconnect && !peers.size){ pendingReconnect=false; scheduleReconnect(0); }
   }
 }
 
 function queuedNotice(){
-  if(!hasConnected){ toast('Will send when peer connects'); return; }
-  toast('Queued — reconnecting...');
+  toast(hasConnected ? 'Queued — reconnecting...' : 'Queued — connecting...');
+  clearReconnectTimer();
   scheduleReconnect(0);
 }
 function addLocalFileMessage(file, caption, ts){
@@ -322,13 +377,20 @@ async function transmitFile(file, caption){
   const id=crypto.randomUUID();
   const type=file.type||mimeFor(file.name);
   const meta={id,name:file.name,size:file.size,type};
-  await sendFileMeta(meta);
-  const buf=new Uint8Array(await file.arrayBuffer());
-  const chunkSize=16*1024;
-  for(let i=0,seq=0;i<buf.length;i+=chunkSize,seq++){
-    await sendFileChunk(buf.slice(i,i+chunkSize), null, {id,i:seq});
+  activeTransfers++;
+  try{
+    await sendFileMeta(meta);
+    const buf=new Uint8Array(await file.arrayBuffer());
+    const chunkSize=16*1024;
+    for(let i=0,seq=0;i<buf.length;i+=chunkSize,seq++){
+      await sendFileChunk(buf.slice(i,i+chunkSize), null, {id,i:seq});
+      markHeard();
+      if(peers.size===0) throw new Error('Peer disconnected');
+    }
+    await sendFileEnd({id,text:caption||''});
+  }finally{
+    activeTransfers = Math.max(0, activeTransfers-1);
   }
-  await sendFileEnd({id,text:caption||''});
 }
 
 async function sendCurrent(){
@@ -338,12 +400,12 @@ async function sendCurrent(){
     const file=pendingFile;
     pendingFile=null; $('filePreview').classList.add('hidden'); $('fileInput').value='';
     addLocalFileMessage(file, text, ts);
-    if(canSend()){ try{ await transmitFile(file, text); }catch(e){ console.error(e); outbox.push({kind:'file', file, caption:text}); queuedNotice(); } }
+    if(canSend()){ try{ await transmitFile(file, text); if(peers.size===0) throw new Error('Peer disconnected'); }catch(e){ console.error(e); outbox.push({kind:'file', file, caption:text}); queuedNotice(); } }
     else { outbox.push({kind:'file', file, caption:text}); queuedNotice(); }
   } else {
     const payload={text, ts};
     addMessage({from:'me', text, ts, self:true});
-    if(canSend()){ try{ await sendMsg(payload); }catch(e){ console.error(e); outbox.push({kind:'text', payload}); queuedNotice(); } }
+    if(canSend()){ try{ await sendMsg(payload); if(peers.size===0) throw new Error('Peer disconnected'); }catch(e){ console.error(e); outbox.push({kind:'text', payload}); queuedNotice(); } }
     else { outbox.push({kind:'text', payload}); queuedNotice(); }
   }
   $('msgInput').value='';
@@ -383,7 +445,7 @@ $('clearFile').onclick=()=>{ pendingFile=null; $('fileInput').value=''; $('fileP
 $('copyPin').onclick=()=>copyText($('pinOut').value); $('copyLink').onclick=()=>copyText($('linkOut').value);
 $('copyPin2').onclick=()=>copyText($('pinSide').value); $('copyLink2').onclick=()=>copyText($('linkSide').value);
 $('leaveBtn').onclick=async()=>{
-  currentPin=null; hasConnected=false; outbox.length=0; clearReconnectTimer();
+  currentPin=null; hasConnected=false; outbox.length=0; pendingReconnect=false; clearReconnectTimer(); stopHeartbeat();
   try{ sessionStorage.removeItem('netchat-pin'); }catch(e){}
   try{ if(room) await room.leave(); }catch(e){}
   location.href=location.origin+location.pathname;
@@ -395,18 +457,23 @@ const initial=qp.get('code')||qp.get('room')||hp.get('room')||hp.get('code')||sa
 if(initial){ $('pinIn').value=initial; startRoom(initial); }
 
 document.querySelectorAll('[data-copy-icon]').forEach(el=>{ el.innerHTML=COPY_SVG; });
-function resumeConnection(){
+function resumeConnection(verify){
   focusComposer();
-  if(currentPin && peers.size===0 && (hasConnected || outbox.length)) scheduleReconnect(0);
+  if(!currentPin || starting || reconnecting) return;
+  if(peers.size>0){ if(verify) verifyConnection(5000); return; }
+  reconnectAttempts = 0;
+  clearReconnectTimer();
+  scheduleReconnect(0);
 }
-window.addEventListener('focus', resumeConnection);
-window.addEventListener('online', resumeConnection);
+window.addEventListener('focus', ()=>resumeConnection(false));
+window.addEventListener('online', ()=>resumeConnection(true));
 window.addEventListener('offline', ()=>{ if(currentPin) setStatus('Offline — will reconnect', false); });
-document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) resumeConnection(); });
+document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) resumeConnection(true); });
+window.addEventListener('pageshow', e=>{ if(e.persisted) resumeConnection(true); });
 setInterval(()=>{
-  if(!currentPin || starting || reconnecting || peers.size>0) return;
-  if(hasConnected || outbox.length) scheduleReconnect();
-}, 12000);
+  if(!currentPin || starting || reconnecting || peers.size>0 || document.hidden) return;
+  scheduleReconnect();
+}, 15000);
 if(window.lucide && lucide.createIcons) lucide.createIcons();
 })();
 </script>

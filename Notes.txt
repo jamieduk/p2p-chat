@@ -35,3 +35,13 @@ Fixed in index.html and index.php:
 - Share links/QR now use https://jnetai.com/apps/p2p-chat/?code=<PIN> everywhere, and ?code=... / #room=... auto-joins on load.
 - Join input now accepts a full invite URL, PIN, or code.
 Verified in headless Chromium: create shows PIN/link/QR, ?code= join works, two peers connect and messages deliver.
+
+
+Fixed in index.html and index.php (auto-reconnect / no missed messages):
+- Reconnect now runs automatically when a peer leaves, when the page regains focus/visibility/network, and on a periodic watchdog while disconnected.
+- Sending a message or attachment while disconnected now queues it and triggers an immediate reconnect first; queued items are flushed as soon as a peer joins.
+- Failed outbox flushes keep the item queued (previously the item was dropped), and a send that loses the peer mid-flight is requeued.
+- Added ping/pong heartbeat actions: stale connections (silent drops) are detected and forced to reconnect; resume/visibility checks probe the peer before trusting the connection.
+- Reconnect requests made during an in-progress start/reconnect are deferred (pendingReconnect) instead of being lost.
+- Added pageshow (bfcache) resume handling. Existing sessionStorage PIN resume retained.
+Verified with a mocked signaling harness in headless Chromium: auto reconnect after peer leave, queued send before connect, queued flush on rejoin, focus-expedited reconnect, and heartbeat-triggered reconnect (10/10 checks). Real Trystero/CDN load confirmed create -> PIN -> waiting for peer with no page errors.
