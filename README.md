@@ -1,6 +1,8 @@
 # Net Chat (P2P)
 
-https://github.com/jamieduk/p2p-chat/
+https://github.com/jamieduk/p2p-chat
+
+<img width="1041" height="737" alt="Screenshot From 2026-11-16 00-16-34" src="https://github.com/user-attachments/assets/93e414de-6867-4ec3-bbbd-de8868e39ea2" />
 
 Anonymous, browser-based peer-to-peer chat with file sharing. No accounts or app server required for messages/files — data flows directly between peers over WebRTC data channels.
 
